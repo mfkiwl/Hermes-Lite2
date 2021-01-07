@@ -2,18 +2,34 @@ module radio (
 
   clk,
   clk_2x,
+  
+  rst_channels,
 
-  cw_keydown,
+  rst_all,
+  rst_nco,
+
+  link_running,
+  link_master,
+  lm_data,
+  lm_valid,
+
+  ls_valid,
+  ls_done,
+
+  run,
+  qmsec_pulse,
+  ext_keydown,
+
   tx_on,
-  tx_cw_key,    // CW waveform is active, tx_cw_level is not zero
-  tx_hang,
+  cw_on,
 
   // Transmit
   tx_tdata,
-  tx_tid,
   tx_tlast,
   tx_tready,
   tx_tvalid,
+  tx_tuser,
+  tx_twait,
 
   tx_data_dac,
 
@@ -41,18 +57,23 @@ module radio (
   cmd_addr,
   cmd_data,
   cmd_rqst,
-  cmd_ack
+  cmd_ack,
+
+  debug_out
 );
 
 parameter         NR = 3;
 parameter         NT = 1;
 parameter         LRDATA = 0;
 parameter         VNA = 1;
-parameter         CWSHAPE = 1;
 parameter         CLK_FREQ = 76800000;
 
 parameter         RECEIVER2 = 0;
 parameter         QS1R = 0;
+
+parameter         DEBUGRX = 0;
+
+parameter         HL2LINK = 0;
 
 // B57 = 2^57.   M2 = B57/OSC
 // 61440000
@@ -74,47 +95,51 @@ localparam RATE96  =  RATE48  >> 1;
 localparam RATE192 =  RATE96  >> 1;
 localparam RATE384 =  RATE192 >> 1;
 
+localparam CALCTYPE = (NR > 6) ? 0 : 3;
 
-input             clk;
-input             clk_2x;
-
-input             cw_keydown;
-input             tx_on;
-output            tx_cw_key;
-output            tx_hang;
-
-input             clk_envelope;
-output            tx_envelope_pwm_out;
-output            tx_envelope_pwm_out_inv;
-
-input   [31:0]    tx_tdata;
-input   [ 2:0]    tx_tid;
-input             tx_tlast;
-output            tx_tready;
-input             tx_tvalid;
-
-input   [31:0]    lr_tdata;
-input   [ 2:0]    lr_tid;
-input             lr_tlast;
-output            lr_tready;
-input             lr_tvalid;
-
-output  [11:0]    tx_data_dac;
-
-input   [11:0]    rx_data_adc;
-
-output  [23:0]    rx_tdata;
-output            rx_tlast;
-input             rx_tready;
-output            rx_tvalid;
-output  [ 1:0]    rx_tuser;
-
-
+input         clk                    ;
+input         clk_2x                 ;
+input         rst_channels           ;
+input         rst_all                ;
+input         rst_nco                ;
+input         link_running           ;
+input         link_master            ;
+input  [23:0] lm_data                ;
+input         lm_valid               ;
+output        ls_valid               ;
+input         ls_done                ;
+input         run                    ;
+input         qmsec_pulse            ;
+input         ext_keydown            ;
+output        tx_on                  ;
+output        cw_on                  ;
+input         clk_envelope           ;
+output        tx_envelope_pwm_out    ;
+output        tx_envelope_pwm_out_inv;
+input  [31:0] tx_tdata               ;
+input         tx_tlast               ;
+output        tx_tready              ;
+input         tx_tvalid              ;
+input  [ 3:0] tx_tuser               ;
+output        tx_twait               ;
+input  [31:0] lr_tdata               ;
+input  [ 2:0] lr_tid                 ;
+input         lr_tlast               ;
+output        lr_tready              ;
+input         lr_tvalid              ;
+output [11:0] tx_data_dac            ;
+input  [11:0] rx_data_adc            ;
+output [23:0] rx_tdata               ;
+output        rx_tlast               ;
+input         rx_tready              ;
+output        rx_tvalid              ;
+output [ 1:0] rx_tuser               ;
 // Command slave interface
-input   [5:0]     cmd_addr;
-input   [31:0]    cmd_data;
-input             cmd_rqst;
-output            cmd_ack;
+input  [ 5:0]        cmd_addr ;
+input  [31:0]        cmd_data ;
+input                cmd_rqst ;
+output               cmd_ack  ;
+output logic [15:0]  debug_out;
 
 
 logic [ 1:0]        tx_predistort = 2'b00;
@@ -131,11 +156,12 @@ logic  [15:0]       vna_count_next;
 logic  [ 1:0]       rx_rate = 2'b00;
 logic  [ 1:0]       rx_rate_next;
 
-logic  [ 4:0]       last_chan = 5'h0;
-logic  [ 4:0]       last_chan_next;
+logic  [ 3:0]       last_chan = 4'h0;
+logic  [ 3:0]       last_chan_next;
 
-logic  [ 4:0]       chan = 5'h0;
-logic  [ 4:0]       chan_next;
+logic  [ 3:0]       chan = 4'h0;
+logic  [ 3:0]       chan_next;
+logic  [ 3:0]       chan_index = 4'h0;
 
 logic               duplex = 1'b0;
 logic               duplex_next;
@@ -148,29 +174,34 @@ logic  [ 9:0]       PWM_max = 10'd1023; // maximum width of TX envelope PWM puls
 logic  [ 9:0]       PWM_max_next;
 
 logic   [5:0]       rate;
-logic   [11:0]      adcpipe [0:3];
+logic   [11:0]      adcpipe [0:4];
 
 
-logic [23:0]  rx_data_i [0:NR-1];
-logic [23:0]  rx_data_q [0:NR-1];
-logic         rx_data_rdy [0:NR-1];
+logic [23:0]  rx_data_i [0:9];
+logic [23:0]  rx_data_q [0:9];
+logic         rx_data_rdy [0:9];
 
 logic [63:0]  freqcomp;
-logic [31:0]  freqcompp [0:3];
-logic [5:0]   chanp [0:3];
+logic [31:0]  freqcompp [0:2];
+logic [3:0]   chanp [0:2];
 
 
-logic [31:0]  rx_phase [0:NR];    // The Rx phase calculated from the frequency sent by the PC.
+logic [31:0]  rx_phase [0:9];    // The Rx phase calculated from the frequency sent by the PC.
 logic [31:0]  tx_phase0;
 
-// Always one more so that dangling assignment can be made
-logic signed [17:0]   mixdata_i [0:NR];
-logic signed [17:0]   mixdata_q [0:NR]; 
+logic signed [17:0]   mixdata_i [0:9];
+logic signed [17:0]   mixdata_q [0:9];
+
+logic [3:0] nco_index;
+
+logic [33:0] debug;
+
+logic [5:0]  synced_receivers   = 6'h00;
 
 
 genvar c;
 
-localparam 
+localparam
   CMD_IDLE    = 2'b00,
   CMD_FREQ1   = 2'b01,
   CMD_FREQ2   = 2'b11,
@@ -232,7 +263,7 @@ always @* begin
           6'h00: begin
             rx_rate_next              = cmd_data[25:24];
             pa_mode_next              = cmd_data[16];
-            last_chan_next            = cmd_data[7:3];
+            last_chan_next            = cmd_data[6:3];
             duplex_next               = cmd_data[2];
           end
 
@@ -256,8 +287,8 @@ always @* begin
           end
 
           default:  cmd_state_next = cmd_state;
-        endcase 
-      end        
+        endcase
+      end
     end
 
     CMD_FREQ1: begin
@@ -283,6 +314,63 @@ end
 // is guarded by CDC handshake
 assign freqcomp = cmd_data * M2 + M3;
 
+// Map address to phase index
+always @* begin
+  if (link_running & link_master) begin
+    case(cmd_addr[4:0])
+      5'h01   : nco_index = 4'hf; // TX
+      5'h02   : nco_index = 4'h0;
+      5'h03   : nco_index = 4'he;
+      5'h04   : nco_index = 4'h1;
+      5'h05   : nco_index = 4'he;
+      5'h06   : nco_index = 4'h2;
+      5'h07   : nco_index = 4'he;
+      5'h08   : nco_index = 4'h3;
+      5'h12   : nco_index = 4'he;
+      5'h13   : nco_index = 4'h4;
+      5'h14   : nco_index = 4'he;
+      5'h15   : nco_index = 4'h5;
+      5'h16   : nco_index = 4'he;
+      default : nco_index = 4'he;
+    endcase
+  end else if (link_running & ~link_master) begin
+    case(cmd_addr[4:0])
+      5'h01   : nco_index = 4'he; // TX
+      5'h02   : nco_index = {~synced_receivers[0],3'h0};
+      5'h03   : nco_index = { synced_receivers[0],3'h0};
+      5'h04   : nco_index = {~synced_receivers[1],3'h1};
+      5'h05   : nco_index = { synced_receivers[1],3'h1};
+      5'h06   : nco_index = {~synced_receivers[2],3'h2};
+      5'h07   : nco_index = { synced_receivers[2],3'h2};
+      5'h08   : nco_index = {~synced_receivers[3],3'h3};
+      5'h12   : nco_index = { synced_receivers[3],3'h3};
+      5'h13   : nco_index = {~synced_receivers[4],3'h4};
+      5'h14   : nco_index = { synced_receivers[4],3'h4};
+      5'h15   : nco_index = {~synced_receivers[5],3'h5};
+      5'h16   : nco_index = { synced_receivers[5],3'h5};
+      default : nco_index = 4'he;
+    endcase    
+  end else begin
+    case(cmd_addr[4:0])
+      5'h01   : nco_index = 4'hf; // TX
+      5'h02   : nco_index = 4'h0;
+      5'h03   : nco_index = 4'h1;
+      5'h04   : nco_index = 4'h2;
+      5'h05   : nco_index = 4'h3;
+      5'h06   : nco_index = 4'h4;
+      5'h07   : nco_index = 4'h5;
+      5'h08   : nco_index = 4'h6;
+      5'h12   : nco_index = 4'h7;
+      5'h13   : nco_index = 4'h8;
+      5'h14   : nco_index = 4'h9;
+      5'h15   : nco_index = 4'ha;
+      5'h16   : nco_index = 4'hb;
+      default : nco_index = 4'hx;
+    endcase
+  end
+end
+
+
 // Pipeline freqcomp
 always @ (posedge clk) begin
   // Pipeline to allow 2 cycles for multiply
@@ -290,24 +378,22 @@ always @ (posedge clk) begin
     freqcompp[0] <= freqcomp[56:25];
     freqcompp[1] <= freqcomp[56:25];
     freqcompp[2] <= freqcomp[56:25];
-    freqcompp[3] <= freqcomp[56:25];
-    chanp[0] <= cmd_addr;
-    chanp[1] <= cmd_addr;
-    chanp[2] <= cmd_addr;
-    chanp[3] <= cmd_addr;
+    chanp[0] <= nco_index;
+    chanp[1] <= nco_index;
+    chanp[2] <= nco_index;
   end
 end
 
 // TX0 and RX0
 always @ (posedge clk) begin
   if (cmd_state == CMD_FREQ3) begin
-    if (chanp[0] == 6'h01) begin 
-      tx_phase0 <= freqcompp[0]; 
-      if (!duplex && (last_chan == 5'b00000)) rx_phase[0] <= freqcompp[0];
+    if (chanp[0] == 4'hf) begin
+      tx_phase0 <= freqcompp[0];
+      if (!duplex && (last_chan == 4'b0000)) rx_phase[0] <= freqcompp[0];
     end
 
-    if (chanp[0] == 6'h02) begin 
-      if (!duplex && (last_chan == 5'b00000)) rx_phase[0] <= tx_phase0;
+    if (chanp[0] == 4'h0) begin
+      if (!duplex && (last_chan == 4'b0000)) rx_phase[0] <= tx_phase0;
       else rx_phase[0] <= freqcompp[0];
     end
   end
@@ -318,21 +404,13 @@ generate
   for (c = 1; c < NR; c = c + 1) begin: RXIFFREQ
     always @ (posedge clk) begin
       if (cmd_state == CMD_FREQ3) begin
-        if (chanp[c/8] == ((c < 7) ? c+2 : c+11)) begin
-          rx_phase[c] <= freqcompp[c/8]; 
-        end
+        if (chanp[c/4] == c) rx_phase[c] <= freqcompp[c/4];
       end
     end
   end
 endgenerate
 
-// Pipeline for adc fanout
-always @ (posedge clk) begin
-  adcpipe[0] <= rx_data_adc;
-  adcpipe[1] <= rx_data_adc;
-  adcpipe[2] <= rx_data_adc;
-  adcpipe[3] <= rx_data_adc;
-end
+
 
 // set the decimation rate 40 = 48k.....2 = 960k
 always @ (rx_rate) begin
@@ -346,8 +424,9 @@ always @ (rx_rate) begin
 end
 
 logic [31:0]  tx0_phase;    // For VNAscan, starts at tx_phase0 and increments for vna_count points; else tx_phase0.
+logic [ 1:0]  tx0_phase_zero; // True when tx0_phase should be reset to zero
 
-generate if (VNA == 1) begin: VNA1
+//generate if (VNA == 1) begin: VNA1
 
 // VNA scanning code added by Jim Ahlstrom, N2ADR, May 2018.
 // The firmware can scan frequencies for the VNA if vna_count > 0. The vna then controls the Rx and Tx frequencies.
@@ -371,7 +450,7 @@ assign rx_data_q[0] = VNA_SCAN_FPGA ? vna_out_Q : rx0_out_Q;
 // This module is a replacement for receiver zero when the FPGA scans in VNA mode.
 vna_scanner #(.CICRATE(CICRATE), .RATE48(RATE48)) rx_vna (  // use this output for VNA_SCAN_FPGA
     //control
-    .clock(clk),
+    .clk(clk),
     .freq_delta(rx_phase[0]),
     .output_strobe(vna_strobe),
     //input
@@ -382,30 +461,32 @@ vna_scanner #(.CICRATE(CICRATE), .RATE48(RATE48)) rx_vna (  // use this output f
     .out_data_Q(vna_out_Q),
     // VNA mode data
     .vna(vna),
-    .Tx_frequency_in(tx_phase0),
-    .Tx_frequency_out(tx0_phase),
+    .tx_freq_in(tx_phase0),
+    .tx_freq(tx0_phase),
+    .tx_zero(tx0_phase_zero),
+    .rx0_phase(rx0_phase),
     .vna_count(vna_count)
     );
 
 
-  // First receiver
-  // If in VNA mode use the Tx[0] phase word for the first receiver phase
-  assign rx0_phase = vna ? tx0_phase : rx_phase[0];
-
-  mix2 #(.CALCTYPE(3)) mix2_0 (
+  // One receiver minimum
+  mix2 #(.CALCTYPE(CALCTYPE)) mix2_0 (
     .clk(clk),
     .clk_2x(clk_2x),
-    .rst(1'b0),
+    .rst(rst_nco | &tx0_phase_zero),
     .phi0(rx0_phase),
-    .phi1(rx_phase[1]),
-    .adc(adcpipe[0]), 
+    .phi1(rx_phase[2]),
+    .adc(adcpipe[0]),
     .mixdata0_i(mixdata_i[0]),
     .mixdata0_q(mixdata_q[0]),
-    .mixdata1_i(mixdata_i[1]),
-    .mixdata1_q(mixdata_q[1])
+    .mixdata1_i(mixdata_i[2]),
+    .mixdata1_q(mixdata_q[2])
   );
+  assign cordic_data_I = mixdata_i[0];
+  assign cordic_data_Q = mixdata_q[0];
 
   receiver_nco #(.CICRATE(CICRATE)) receiver_0 (
+    .rst_all(rst_all),
     .clock(clk),
     .clock_2x(clk_2x),
     .rate(rate),
@@ -413,204 +494,233 @@ vna_scanner #(.CICRATE(CICRATE), .RATE48(RATE48)) rx_vna (  // use this output f
     .mixdata_Q(mixdata_q[0]),
     .out_strobe(rx0_strobe),
     .out_data_I(rx0_out_I),
-    .out_data_Q(rx0_out_Q)
+    .out_data_Q(rx0_out_Q),
+    .debug(debug)
   );
 
-  assign cordic_data_I = mixdata_i[0];
-  assign cordic_data_Q = mixdata_q[0];
 
-//  receiver #(.CICRATE(CICRATE)) receiver_0_inst (
-//    .clock(clk),
-//    .clock_2x(clk_2x),
-//    .rate(rate),
-//    .frequency(rx0_phase),
-//    .out_strobe(rx0_strobe),
-//    .in_data(adcpipe[0]),
-//    .out_data_I(rx0_out_I),
-//    .out_data_Q(rx0_out_Q),
-//    .cordic_outdata_I(cordic_data_I),
-//    .cordic_outdata_Q(cordic_data_Q)
-//  );
+generate
 
-  //for (c = 1; c < NR; c = c + 1) begin: MDC
-  //  if((c==3 && NR>3) || (c==1 && NR<=3)) begin
-  //      receiver #(.CICRATE(CICRATE)) receiver_inst (
-  //        .clock(clk),
-  //        .clock_2x(clk_2x),
-  //        .rate(rate),
-  //        .frequency(rx_phase[c]),
-  //        .out_strobe(rx_data_rdy[c]),
-  //        .in_data((tx_on & pure_signal) ? tx_data_dac : adcpipe[c/8]), //tx_data was pipelined here once
-  //        .out_data_I(rx_data_i[c]),
-  //        .out_data_Q(rx_data_q[c])
-  //      );
-  //  end else begin
-  //      receiver_nco #(.CICRATE(CICRATE)) receiver_inst (
-  //        .clock(clk),
-  //        .clock_2x(clk_2x),
-  //        .rate(rate),
-  //        .frequency(rx_phase[c]),
-  //        .out_strobe(rx_data_rdy[c]),
-  //        .in_data(adcpipe[c/8]),
-  //        .out_data_I(rx_data_i[c]),
-  //        .out_data_Q(rx_data_q[c])
-  //      );
-  //  end
-  //end
+if (NR >= 2) begin: MIX1_3
+  // Always build second mixer for second receiver for PureSignal support
+  mix2 #(.CALCTYPE(CALCTYPE)) mix2_2 (
+    .clk(clk),
+    .clk_2x(clk_2x),
+    .rst(rst_nco),
+    .phi0(rx_phase[1]),
+    .phi1(rx_phase[3]),
+    .adc((tx_on & pure_signal) ? tx_data_dac : adcpipe[1]),
+    .mixdata0_i(mixdata_i[1]),
+    .mixdata0_q(mixdata_q[1]),
+    .mixdata1_i(mixdata_i[3]),
+    .mixdata1_q(mixdata_q[3])
+  );
+end
 
-  for (c = 1; c < NR; c = c + 1) begin: MDC
+if (NR >= 2) begin: RECEIVER1
+  receiver_nco #(.CICRATE(CICRATE)) receiver_1 (
+    .rst_all(rst_all),
+    .clock(clk),
+    .clock_2x(clk_2x),
+    .rate(rate),
+    .mixdata_I(mixdata_i[1]),
+    .mixdata_Q(mixdata_q[1]),
+    .out_strobe(rx_data_rdy[1]),
+    .out_data_I(rx_data_i[1]),
+    .out_data_Q(rx_data_q[1])
+  );
+end
 
-    if (c == 2) begin
-      // Build double mixer
-      mix2 #(.CALCTYPE(3)) mix2_i (
-        .clk(clk),
-        .clk_2x(clk_2x),
-        .rst(1'b0),
-        .phi0(rx_phase[c]),
-        .phi1(rx_phase[c+1]),
-        .adc(adcpipe[c/8]), 
-        .mixdata0_i(mixdata_i[c]),
-        .mixdata0_q(mixdata_q[c]),
-        .mixdata1_i(mixdata_i[c+1]),
-        .mixdata1_q(mixdata_q[c+1])
-      );
-    end
+if (NR >= 3) begin: RECEIVER2
+  receiver_nco #(.CICRATE(CICRATE)) receiver_2 (
+    .rst_all(rst_all),
+    .clock(clk),
+    .clock_2x(clk_2x),
+    .rate(rate),
+    .mixdata_I(mixdata_i[2]),
+    .mixdata_Q(mixdata_q[2]),
+    .out_strobe(rx_data_rdy[2]),
+    .out_data_I(rx_data_i[2]),
+    .out_data_Q(rx_data_q[2])
+  );
+end
 
-    if (c == 4) begin
-      // Build double mixer
-      // Receiver 3 (zero indexed so fourth RX) is feedback for puresignal
-      // Will need to split this later if more than 4 receivers
-      mix2 #(.CALCTYPE(4)) mix2_i (
-        .clk(clk),
-        .clk_2x(clk_2x),
-        .rst(1'b0),
-        .phi0(rx_phase[c]),
-        .phi1(rx_phase[c+1]),
-        .adc( (tx_on & pure_signal) ? tx_data_dac : adcpipe[c/8]),
-        .mixdata0_i(mixdata_i[c]),
-        .mixdata0_q(mixdata_q[c]),
-        .mixdata1_i(mixdata_i[c+1]),
-        .mixdata1_q(mixdata_q[c+1])
-      );
-    end
+if (NR >= 4) begin: RECEIVER3
+  receiver_nco #(.CICRATE(CICRATE), .REGISTER_OUTPUT(HL2LINK)) receiver_3 (
+    .rst_all(rst_all),
+    .clock(clk),
+    .clock_2x(clk_2x),
+    .rate(rate),
+    .mixdata_I(mixdata_i[3]),
+    .mixdata_Q(mixdata_q[3]),
+    .out_strobe(rx_data_rdy[3]),
+    .out_data_I(rx_data_i[3]),
+    .out_data_Q(rx_data_q[3])
+  );
+end
 
-    receiver_nco #(.CICRATE(CICRATE)) receiver_inst (
-      .clock(clk),
-      .clock_2x(clk_2x),
-      .rate(rate),
-      .mixdata_I(mixdata_i[c]),
-      .mixdata_Q(mixdata_q[c]),
-      .out_strobe(rx_data_rdy[c]),
-      .out_data_I(rx_data_i[c]),
-      .out_data_Q(rx_data_q[c])
-    );
+if (NR >= 5) begin: MIX4_5
+  // Build double mixer
+  mix2 #(.CALCTYPE(CALCTYPE)) mix2_4 (
+    .clk(clk),
+    .clk_2x(clk_2x),
+    .rst(rst_nco),
+    .phi0(rx_phase[4]),
+    .phi1(rx_phase[5]),
+    .adc(adcpipe[2]),
+    .mixdata0_i(mixdata_i[4]),
+    .mixdata0_q(mixdata_q[4]),
+    .mixdata1_i(mixdata_i[5]),
+    .mixdata1_q(mixdata_q[5])
+  );
+end
 
-  end
+if (NR >= 5) begin: RECEIVER4
+  receiver_nco #(.CICRATE(CICRATE), .REGISTER_OUTPUT(HL2LINK)) receiver_4 (
+    .rst_all(rst_all),
+    .clock(clk),
+    .clock_2x(clk_2x),
+    .rate(rate),
+    .mixdata_I(mixdata_i[4]),
+    .mixdata_Q(mixdata_q[4]),
+    .out_strobe(rx_data_rdy[4]),
+    .out_data_I(rx_data_i[4]),
+    .out_data_Q(rx_data_q[4])
+  );
+end
 
-end else if (RECEIVER2==1) begin
+if (NR >= 6) begin: RECEIVER5
+  receiver_nco #(.CICRATE(CICRATE), .REGISTER_OUTPUT(HL2LINK)) receiver_5 (
+    .rst_all(rst_all),
+    .clock(clk),
+    .clock_2x(clk_2x),
+    .rate(rate),
+    .mixdata_I(mixdata_i[5]),
+    .mixdata_Q(mixdata_q[5]),
+    .out_strobe(rx_data_rdy[5]),
+    .out_data_I(rx_data_i[5]),
+    .out_data_Q(rx_data_q[5])
+  );
+end
 
-  assign tx0_phase = tx_phase0;
 
-  for (c = 0; c < NR; c = c + 1) begin: RECV2
-    if((c==3 && NR>3) || (c==1 && NR<=3)) begin
-        receiver2 receiver_inst (
-          .clock(clk),
-          .reset(1'b0),
-          .sample_rate(rate),
-          .frequency(rx_phase[c]),
-          .out_strobe(rx_data_rdy[c]),
-          .in_data((tx_on & pure_signal) ? { {4{tx_data_dac[11]}},tx_data_dac} : { {4{adcpipe[c/8][11]}},adcpipe[c/8]}), //tx_data was pipelined here once
-          .out_data_I(rx_data_i[c]),
-          .out_data_Q(rx_data_q[c])
-        );
-    end else begin
-        receiver2 receiver_inst (
-          .clock(clk),
-          .reset(1'b0),
-          .sample_rate(rate),
-          .frequency(rx_phase[c]),
-          .out_strobe(rx_data_rdy[c]),
-          .in_data({ {4{adcpipe[c/8][11]}},adcpipe[c/8]}),
-          .out_data_I(rx_data_i[c]),
-          .out_data_Q(rx_data_q[c])
-        );
-    end
-  end
+if (NR >= 7) begin: MIX6_7
+  // Build double mixer
+  mix2 #(.CALCTYPE(CALCTYPE)) mix2_6 (
+    .clk(clk),
+    .clk_2x(clk_2x),
+    .rst(rst_nco),
+    .phi0(rx_phase[6]),
+    .phi1(rx_phase[7]),
+    .adc(adcpipe[3]),
+    .mixdata0_i(mixdata_i[6]),
+    .mixdata0_q(mixdata_q[6]),
+    .mixdata1_i(mixdata_i[7]),
+    .mixdata1_q(mixdata_q[7])
+  );
+end
 
-end else if (QS1R==1) begin
+if (NR >= 7) begin: RECEIVER6
+  receiver_nco #(.CICRATE(CICRATE), .REGISTER_OUTPUT(HL2LINK)) receiver_6 (
+    .rst_all(rst_all),
+    .clock(clk),
+    .clock_2x(clk_2x),
+    .rate(rate),
+    .mixdata_I(mixdata_i[6]),
+    .mixdata_Q(mixdata_q[6]),
+    .out_strobe(rx_data_rdy[6]),
+    .out_data_I(rx_data_i[6]),
+    .out_data_Q(rx_data_q[6])
+  );
+end
 
-  assign tx0_phase = tx_phase0;
+if (NR >= 8) begin: RECEIVER7
+  receiver_nco #(.CICRATE(CICRATE), .REGISTER_OUTPUT(HL2LINK)) receiver_7 (
+    .rst_all(rst_all),
+    .clock(clk),
+    .clock_2x(clk_2x),
+    .rate(rate),
+    .mixdata_I(mixdata_i[7]),
+    .mixdata_Q(mixdata_q[7]),
+    .out_strobe(rx_data_rdy[7]),
+    .out_data_I(rx_data_i[7]),
+    .out_data_Q(rx_data_q[7])
+  );
+end
 
-  for (c = 0; c < NR; c = c + 1) begin: RECV2
-    if((c==3 && NR>3) || (c==1 && NR<=3)) begin
-        qs1r_receiver receiver_inst (
-          .clock(clk),
-          .rate(rx_rate),
-          .frequency(rx_phase[c]),
-          .out_strobe(rx_data_rdy[c]),
-          .in_data((tx_on & pure_signal) ? { {4{tx_data_dac[11]}},tx_data_dac} : { {4{adcpipe[c/8][11]}},adcpipe[c/8]}), //tx_data was pipelined here once
-          .out_data_I(rx_data_i[c]),
-          .out_data_Q(rx_data_q[c])
-        );
-    end else begin
-        qs1r_receiver receiver_inst (
-          .clock(clk),
-          .rate(rx_rate),
-          .frequency(rx_phase[c]),
-          .out_strobe(rx_data_rdy[c]),
-          .in_data({ {4{adcpipe[c/8][11]}},adcpipe[c/8]}),
-          .out_data_I(rx_data_i[c]),
-          .out_data_Q(rx_data_q[c])
-        );
-    end
-  end
 
-end else begin
+if (NR >= 9) begin: MIX8_9
+  // Build double mixer
+  mix2 #(.CALCTYPE(CALCTYPE)) mix2_8 (
+    .clk(clk),
+    .clk_2x(clk_2x),
+    .rst(rst_nco),
+    .phi0(rx_phase[8]),
+    .phi1(rx_phase[9]),
+    .adc(adcpipe[4]),
+    .mixdata0_i(mixdata_i[8]),
+    .mixdata0_q(mixdata_q[8]),
+    .mixdata1_i(mixdata_i[9]),
+    .mixdata1_q(mixdata_q[9])
+  );
+end
 
-  assign tx0_phase = tx_phase0;
+if (NR >= 9) begin: RECEIVER8
+  receiver_nco #(.CICRATE(CICRATE), .REGISTER_OUTPUT(HL2LINK)) receiver_8 (
+    .rst_all(rst_all),
+    .clock(clk),
+    .clock_2x(clk_2x),
+    .rate(rate),
+    .mixdata_I(mixdata_i[8]),
+    .mixdata_Q(mixdata_q[8]),
+    .out_strobe(rx_data_rdy[8]),
+    .out_data_I(rx_data_i[8]),
+    .out_data_Q(rx_data_q[8])
+  );
+end
 
-  // Default to receiver type 1
-  for (c = 0; c < NR; c = c + 1) begin: MDC
-    if((c==3 && NR>3) || (c==1 && NR<=3)) begin
-        receiver #(.CICRATE(CICRATE)) receiver_inst (
-          .clock(clk),
-          .clock_2x(clk_2x),
-          .rate(rate),
-          .frequency(rx_phase[c]),
-          .out_strobe(rx_data_rdy[c]),
-          .in_data((tx_on & pure_signal) ? tx_data_dac : adcpipe[c/8]), //tx_data was pipelined here once
-          .out_data_I(rx_data_i[c]),
-          .out_data_Q(rx_data_q[c])
-        );
-    end else begin
-        receiver #(.CICRATE(CICRATE)) receiver_inst (
-          .clock(clk),
-          .clock_2x(clk_2x),
-          .rate(rate),
-          .frequency(rx_phase[c]),
-          .out_strobe(rx_data_rdy[c]),
-          .in_data(adcpipe[c/8]),
-          .out_data_I(rx_data_i[c]),
-          .out_data_Q(rx_data_q[c])
-        );
-    end
-  end
-end endgenerate
+if (NR >= 10) begin: RECEIVER9
+  receiver_nco #(.CICRATE(CICRATE), .REGISTER_OUTPUT(HL2LINK)) receiver_9 (
+    .rst_all(rst_all),
+    .clock(clk),
+    .clock_2x(clk_2x),
+    .rate(rate),
+    .mixdata_I(mixdata_i[9]),
+    .mixdata_Q(mixdata_q[9]),
+    .out_strobe(rx_data_rdy[9]),
+    .out_data_I(rx_data_i[9]),
+    .out_data_Q(rx_data_q[9])
+  );
+end
+
+
+endgenerate
+
 
 
 // Send RX data upstream
-localparam 
-  RXUS_WAIT1  = 2'b00,
-  RXUS_I      = 2'b10,
-  RXUS_Q      = 2'b11,
-  RXUS_WAIT0  = 2'b01;
+localparam
+  RXUS_WAIT1  = 3'b000,
+  RXUS_I      = 3'b001,
+  RXUS_Q      = 3'b011,
+  RXUS_WAIT0  = 3'b010,
+  RXUSLM_I    = 3'b111,
+  RXUSLM_Q    = 3'b110,
+  RXUSLS_I    = 3'b100,
+  RXUSLS_Q    = 3'b101;
 
-logic [1:0]   rxus_state = RXUS_WAIT1;
-logic [1:0]   rxus_state_next;
+
+logic [2:0]   rxus_state = RXUS_WAIT1;
+logic [2:0]   rxus_state_next;
 
 always @(posedge clk) begin
-  rxus_state <= rxus_state_next;
-  chan <= chan_next;
+  if (rst_all || rst_channels) begin
+    rxus_state <= RXUS_WAIT1;
+    chan <= 4'h0;
+  end else begin
+    rxus_state <= rxus_state_next;
+    chan <= chan_next;
+  end
 end
 
 always @* begin
@@ -624,40 +734,100 @@ always @* begin
   rx_tvalid = 1'b0;
   rx_tuser  = 2'b00;
 
+  ls_valid = 1'b0;
+
+  chan_index = link_running ? (chan >> 1) : chan;
+
   case(rxus_state)
     RXUS_WAIT1: begin
-      chan_next = 5'h0;
-      if (rx_data_rdy[0] & rx_tready) begin
-        rxus_state_next = RXUS_I;
+      chan_next = 4'h0;
+      if (rx_data_rdy[0]) begin
+        if (link_running & ~link_master) rxus_state_next = RXUSLS_I;
+        else if (rx_tready) rxus_state_next = RXUS_I;
       end
     end
 
     RXUS_I: begin
       rx_tvalid = 1'b1;
-      rx_tdata = rx_data_i[chan];
+      rx_tdata = rx_data_i[chan_index];
       rx_tuser = 2'b00; // Bit 0 will appear as left mic LSB in VNA mode, add VNA here
       rxus_state_next = RXUS_Q;
     end
 
     RXUS_Q: begin
       rx_tvalid = 1'b1;
-      rx_tdata = rx_data_q[chan];
+      rx_tdata = rx_data_q[chan_index];
 
-      if (chan == last_chan) begin
+      if (chan >= last_chan) begin
         rx_tlast = 1'b1;
         rxus_state_next = RXUS_WAIT0;
       end else begin
-        chan_next = chan + 5'h1;
-        rxus_state_next = RXUS_I;
+        chan_next = chan + 4'h1;
+        if (link_running & link_master) rxus_state_next = RXUSLM_I;
+        else rxus_state_next = RXUS_I;
+      end
+    end
+
+    RXUSLM_I: begin
+      rx_tdata = lm_data;
+      if (rx_data_rdy[0]) begin
+        rxus_state_next = RXUS_WAIT0; // Escape
+      end else if (lm_valid) begin
+        rx_tvalid = 1'b1;
+        rxus_state_next = RXUSLM_Q;
+      end
+    end
+
+    RXUSLM_Q: begin
+      rx_tdata = lm_data;
+      if (rx_data_rdy[0]) begin
+        rxus_state_next= RXUS_WAIT0; // Escape
+      end else if (lm_valid) begin
+        rx_tvalid = 1'b1;
+        if (chan >= last_chan) begin
+          rx_tlast = 1'b1;
+          rxus_state_next = RXUS_WAIT0;
+        end else begin
+          chan_next = chan + 4'h1;
+          rxus_state_next = RXUS_I;
+        end
       end
     end
 
     RXUS_WAIT0: begin
-      chan_next = 5'h0;
+      chan_next = 4'h0;
       if (~rx_data_rdy[0]) begin
         rxus_state_next = RXUS_WAIT1;
       end
     end
+
+    RXUSLS_I: begin
+      if ((chan >= last_chan) | rx_data_rdy[0]) begin
+        rxus_state_next = RXUS_WAIT0; // Escape
+      end else begin
+        ls_valid = 1'b1;
+        rx_tdata = rx_data_i[chan_index];
+        if (ls_done) rxus_state_next = RXUSLS_Q;
+      end
+    end
+
+    RXUSLS_Q: begin
+      ls_valid = 1'b1;
+      rx_tdata = rx_data_q[chan_index];
+
+      if (rx_data_rdy[0]) begin
+        rxus_state_next = RXUS_WAIT0; // Escape
+      end else if (ls_done) begin
+        if (chan >= last_chan) begin
+          rxus_state_next = RXUS_WAIT0;
+        end else begin
+          chan_next = chan + 4'h2;
+          rxus_state_next = RXUSLS_I;
+        end
+      end
+    end
+
+
 
   endcase // rxus_state
 end
@@ -708,82 +878,255 @@ generate if (NT == 0) begin
   // No transmit
   assign tx_tready = 1'b0;
   assign tx_data_dac = 12'h000;
-  assign tx_hang = 1'b0;
 
 end else begin
 
-  // At least one transmit
-  logic signed [15:0] tx_fir_i;
-  logic signed [15:0] tx_fir_q;
-  
-  logic         req2;
-  logic [19:0]  y1_r, y1_i;
-  logic [15:0]  y2_r, y2_i;
-  
-  logic signed [15:0] tx_cordic_i_out;
-  logic signed [15:0] tx_cordic_q_out;
-  
-  logic signed [15:0] tx_i;
-  logic signed [15:0] tx_q;
-  
-  logic signed [15:0] txsum;
-  logic signed [15:0] txsumq;
-  
-  logic [31:0]  tx_phase [0:NT-1];    // The Tx phase calculated from the frequency sent by the PC.
-  
-  logic [18:0]        tx_cw_level;
+// At least one transmit
+logic signed [15:0] tx_fir_i, tx_fir_i_next;
+logic signed [15:0] tx_fir_q, tx_fir_q_next;
 
-// TX 
-for (c = 0; c < NT; c = c + 1) begin: TXIFFREQ
-  if (c == 0) begin
-    assign tx_phase[0] = tx0_phase;
-  end else begin
-    always @ (posedge clk) begin
-      if (cmd_state == CMD_FREQ3) begin
-        if (chanp[c/8] == ((c < 7) ? c+2 : c+11)) begin
-          tx_phase[c] <= freqcompp[c/8]; 
-        end
-      end
+logic         req2;
+logic [19:0]  y1_r, y1_i;
+logic [15:0]  y2_r, y2_i;
+
+logic signed [15:0] tx_cordic_i_out;
+logic signed [15:0] tx_cordic_q_out;
+
+logic signed [15:0] tx_i;
+logic signed [15:0] tx_q;
+
+logic signed [15:0] txsum;
+logic signed [15:0] txsumq;
+
+logic [ 8:0]  tx_qmsectimer_next, tx_qmsectimer = 9'h00;
+logic [18:0]  tx_cwlevel_next, tx_cwlevel = 19'h0;
+
+logic cwx_keydown;
+logic cwx_keyup;
+logic ptt;
+logic fir_tready;
+
+localparam
+  NOTX      = 3'b000,
+  PTTTX     = 3'b011,
+  PRETX     = 3'b001,
+  CWTX      = 3'b101,
+  CWHANG    = 3'b100;
+//  CWXTX     = 3'b010,
+//  CWXHANG   = 3'b011;
+
+logic [ 2:0] tx_state           = NOTX ;
+logic [ 2:0] tx_state_next             ;
+logic        tx_cw_key                 ;
+logic [ 9:0] cw_hang_time              ;
+logic [10:0] accumdelay                ;
+logic        accumdelay_incr           ;
+logic        accumdelay_decr           ;
+logic        accumdelay_notzero        ;
+logic [ 6:0] tx_buffer_latency  = 7'h14; // Default to 20ms
+logic [ 4:0] ptt_hang_time      = 5'h0c; // Default to 12ms
+
+localparam MAX_CWLEVEL = 19'h4d800; //(16'h4d80 << 4);
+localparam MIN_CWLEVEL = 19'h0;
+
+always @(posedge clk) begin
+  if (accumdelay_incr) accumdelay <= accumdelay + 1;
+  else if (accumdelay_decr & accumdelay_notzero) accumdelay <= accumdelay -1;
+end
+assign accumdelay_notzero = |accumdelay;
+
+
+always @(posedge clk) begin
+  if (cmd_rqst) begin
+    if (cmd_addr == 6'h10) begin
+      cw_hang_time <= {cmd_data[31:24], cmd_data[17:16]};
+    end else if (cmd_addr == 6'h17) begin
+      tx_buffer_latency <= cmd_data[6:0];
+      ptt_hang_time <= cmd_data[12:8];
+    end else if (cmd_addr == 6'h39 & cmd_data[23]) begin
+      synced_receivers <= cmd_data[21:16];
     end
   end
 end
 
-  // latch I&Q data on strobe from FIR
-  // No backpressure from FIR for now
-  always @ (posedge clk) begin
-    if (tx_tready) begin
-      tx_fir_i <= tx_tdata[31:16];
-      tx_fir_q <= tx_tdata[15:0];
+
+// TX run state machine
+always @(posedge clk) begin
+  tx_state      <= run ? tx_state_next : NOTX;
+  tx_qmsectimer <= tx_qmsectimer_next;
+  tx_cwlevel    <= tx_cwlevel_next;
+  tx_fir_i      <= tx_fir_i_next;
+  tx_fir_q      <= tx_fir_q_next;
+end
+
+always @* begin
+  cwx_keyup   = tx_tuser[1] & tx_tvalid;
+  cwx_keydown = tx_tuser[2] & tx_tvalid;
+  ptt         = tx_tuser[3] & tx_tvalid;
+
+
+  tx_state_next      = tx_state;
+  tx_qmsectimer_next = tx_qmsectimer;
+  tx_cwlevel_next    = tx_cwlevel;
+  tx_fir_i_next      = tx_fir_i;
+  tx_fir_q_next      = tx_fir_q;
+
+  tx_on     = 1'b1;
+  cw_on     = 1'b0;
+  tx_cw_key = 1'b0;
+  tx_tready = fir_tready; // Empty FIFO
+
+  tx_twait  = 1'b0;
+
+  accumdelay_incr = 1'b0;
+  accumdelay_decr = 1'b0;
+
+  case (tx_state)
+
+    NOTX : begin
+      tx_fir_i_next      = 16'h00;
+      tx_fir_q_next      = 16'h00;
+      tx_cwlevel_next    = 19'h00;
+      tx_qmsectimer_next = {tx_buffer_latency, 2'b00};
+      tx_on              = 1'b0;
+
+      // Free accumulated samples to maintain time coherency in tape recorder mode
+      accumdelay_decr = ~fir_tready;
+      tx_tready       = accumdelay_notzero | fir_tready;
+
+      if (ext_keydown | cwx_keydown | cwx_keyup | ptt) tx_state_next = PRETX;
     end
-  end
 
-  // Hang TX until fifo drains
-  assign tx_hang = tx_tvalid;
+    PRETX : begin
+      tx_twait        = 1'b1;
+      tx_tready       = 1'b0; //Stall data to fill FIFO unless in CWX mode
+      accumdelay_incr = fir_tready; // Count samples accumulated
+      if (tx_qmsectimer != 9'h00) begin
+        if (qmsec_pulse) tx_qmsectimer_next = tx_qmsectimer - 9'h01;
+        if (~(ext_keydown | cwx_keydown | cwx_keyup | ptt)) tx_state_next = NOTX;
+      end else begin
+        if (ext_keydown) tx_state_next = CWTX;
+        else if (ptt) tx_state_next = PTTTX;
+        else if (cwx_keydown | cwx_keyup) tx_state_next = CWTX;
+        else tx_state_next = NOTX;
+      end
+    end
 
-  // Interpolate I/Q samples from 48 kHz to the clock frequency
-  FirInterp8_1024 fi (clk, req2, tx_tready, tx_fir_i, tx_fir_q, y1_r, y1_i);  // req2 enables an output sample, tx_tready requests next input sample.
+    PTTTX : begin
+      if (ext_keydown) begin
+        tx_state_next = CWTX;
+      end else if (ptt) begin
+        tx_qmsectimer_next = {2'b00, ptt_hang_time, 2'b00};
+        if (fir_tready) begin
+          tx_fir_i_next = tx_tdata[31:16];
+          tx_fir_q_next = tx_tdata[15:0];
+        end
+      end else begin
+        if (tx_qmsectimer != 9'h00) begin
+          if (qmsec_pulse) tx_qmsectimer_next = tx_qmsectimer - 9'h01;
+        end else begin
+          tx_state_next = NOTX;
+        end
+      end
+    end
 
-  // GBITS reduced to 30
-  CicInterpM5 #(.RRRR(RRRR), .IBITS(20), .OBITS(16), .GBITS(GBITS)) in2 ( clk, 1'd1, req2, y1_r, y1_i, y2_r, y2_i);
+    CWTX : begin
+      cw_on     = 1'b1;
+      tx_cw_key = 1'b1;
+      if (ext_keydown | cwx_keydown) begin
+        // Shape CW on
+        if (tx_cwlevel != MAX_CWLEVEL) tx_cwlevel_next = tx_cwlevel + 19'h01;
+        tx_qmsectimer_next = {tx_buffer_latency, 2'b00};
+      end else begin
+        // Extend CW on to match tx_buffer_latency if ext key
+        if (tx_qmsectimer != 9'h00) begin
+          if (qmsec_pulse) tx_qmsectimer_next = tx_qmsectimer - 9'h01;
+        end else if (tx_cwlevel != 19'h00) tx_cwlevel_next = tx_cwlevel - 19'h01;
+        else if (~cwx_keyup) begin
+          tx_qmsectimer_next = {tx_buffer_latency, 2'b00};
+          tx_cwlevel_next    = {7'b0000000, cw_hang_time, 2'b00};
+          tx_state_next      = CWHANG;
+        end
+      end
+    end
+
+    CWHANG : begin
+      cw_on = 1'b1;
+      if (ext_keydown | cwx_keydown) begin
+        // delay ext CW by tx_buffer_latency
+        if (tx_qmsectimer != 9'h00) begin
+          if (qmsec_pulse) tx_qmsectimer_next = tx_qmsectimer - 9'h01;
+        end else begin
+          tx_qmsectimer_next = {tx_buffer_latency, 2'b00};
+          tx_cwlevel_next    = 19'h0;
+          tx_state_next      = CWTX;
+        end
+      end else begin
+        if (tx_cwlevel != 19'h0) begin
+          if (qmsec_pulse) tx_cwlevel_next = tx_cwlevel - 19'h01;
+        end else begin
+          tx_state_next = NOTX;
+        end
+      end
+    end
+
+
+
+//CWXTX: begin
+//  cw_on = 1'b1;
+//  tx_cw_key = 1'b1;
+//  if (cwx) begin
+//    // Shape CW on
+//    if (tx_cwlevel != MAX_CWLEVEL) tx_cwlevel_next = tx_cwlevel + 19'h01;
+//  end else begin
+//    if (tx_cwlevel != 19'h00) tx_cwlevel_next = tx_cwlevel - 19'h01;
+//    else begin
+//      tx_cwlevel_next = {7'b0000000, cw_hang_time, 2'b00};
+//      tx_state_next = CWXHANG;
+//    end
+//  end
+//end
+
+//CWXHANG: begin
+//  cw_on = 1'b1;
+//  if (cwx) begin
+//    tx_state_next = CWXTX;
+//  end else begin
+//    if (tx_cwlevel != 19'h0) begin
+//      if (qmsec_pulse) tx_cwlevel_next = tx_cwlevel - 19'h01;
+//    end else begin
+//      tx_state_next = NOTX;
+//    end
+//  end
+//end
+
+  endcase
+end
+
+// Interpolate I/Q samples from 48 kHz to the clock frequency
+FirInterp8_1024 fi (clk, req2, fir_tready, tx_fir_i, tx_fir_q, y1_r, y1_i);  // req2 enables an output sample, tx_tready requests next input sample.
+
+// GBITS reduced to 30
+CicInterpM5 #(.RRRR(RRRR), .IBITS(20), .OBITS(16), .GBITS(GBITS)) in2 ( clk, 1'd1, req2, y1_r, y1_i, y2_r, y2_i);
 
 //---------------------------------------------------------
 //    CORDIC NCO
 //---------------------------------------------------------
 
-  // Code rotates input at set frequency and produces I & Q
-  assign          tx_i = vna ? 16'h4d80 : (tx_cw_key ? {1'b0, tx_cw_level[18:4]} : y2_i);    // select vna mode if active. Set CORDIC for max DAC output
-  assign          tx_q = (vna | tx_cw_key) ? 16'h0 : y2_r;                   // taking into account CORDICs gain i.e. 0x7FFF/1.7
+// Code rotates input at set frequency and produces I & Q
+assign tx_i = vna ? 16'h4d80 : (tx_cw_key ? {1'b0, tx_cwlevel[18:4]} : y2_i);    // select vna mode if active. Set CORDIC for max DAC output
+assign tx_q = (vna | tx_cw_key) ? 16'h0 : y2_r;                   // taking into account CORDICs gain i.e. 0x7FFF/1.7
 
 
-  // NOTE:  I and Q inputs reversed to give correct sideband out
-  cpl_cordic #(.OUT_WIDTH(16)) cordic_inst (
-    .clock(clk), 
-    .frequency(tx_phase[0]),
-    .in_data_I(tx_i),
-    .in_data_Q(tx_q), 
-    .out_data_I(tx_cordic_i_out), 
-    .out_data_Q(tx_cordic_q_out)
-  );
+// NOTE:  I and Q inputs reversed to give correct sideband out
+cpl_cordic #(.OUT_WIDTH(16)) cordic_inst (
+  .clock(clk),
+  .frequency(tx0_phase),
+  .in_data_I(tx_i),
+  .in_data_Q(tx_q),
+  .out_data_I(tx_cordic_i_out),
+  .out_data_Q(tx_cordic_q_out)
+);
 
 /*
   We can use either the I or Q output from the CORDIC directly to drive the DAC.
@@ -797,28 +1140,11 @@ end
         = cos(f1 + f2) + j sin(f1 + f2)
 */
 
-  // the CORDIC output is stable on the negative edge of the clock
-if (NT == 1) begin: SINGLETX
-  //gain of 4
-  assign txsum = (tx_cordic_i_out  >>> 2); // + {15'h0000, tx_cordic_i_out[1]};
-  assign txsumq = (tx_cordic_q_out  >>> 2);
 
-end else begin: DUALTX
-  logic signed [15:0] tx_cordic_tx2_i_out;
-  logic signed [15:0] tx_cordic_tx2_q_out;
+//gain of 4
+assign txsum = (tx_cordic_i_out  >>> 2); // + {15'h0000, tx_cordic_i_out[1]};
+assign txsumq = (tx_cordic_q_out  >>> 2);
 
-  cpl_cordic #(.OUT_WIDTH(16)) cordic_tx2_inst (
-    .clock(clk), 
-    .frequency(tx_phase[1]), 
-    .in_data_I(tx_i),
-    .in_data_Q(tx_q), 
-    .out_data_I(tx_cordic_tx2_i_out), 
-    .out_data_Q(tx_cordic_tx2_q_out)
-  );
-
-  assign txsum = (tx_cordic_i_out + tx_cordic_tx2_i_out) >>> 3;
-  assign txsumq = (tx_cordic_q_out + tx_cordic_tx2_q_out) >>> 3;
-end
 
 // LFSR for dither
 //reg [15:0] lfsr = 16'h0001;
@@ -826,8 +1152,6 @@ end
 //    if (~extreset) lfsr <= 16'h0001;
 //    else lfsr <= {lfsr[0],lfsr[15],lfsr[14] ^ lfsr[0], lfsr[13] ^ lfsr[0], lfsr[12], lfsr[11] ^ lfsr[0], lfsr[10:1]};
 
-
-//generate
 
 case (LRDATA)
   0: begin // Left/Right downstream (PC->Card) audio data not used
@@ -918,7 +1242,7 @@ case (LRDATA)
       txsumqr2<=txsumqr;
       iplusq_over_root2r<=iplusq_over_root2;
     end
-  
+
     assign distorted_dac = DACLUTI[txsumr2[11:0]]-DACLUTI[txsumqr2[11:0]]+DACLUTQ[iplusq_over_root2r[12:1]];
 
     always @ (posedge clk) begin
@@ -1000,56 +1324,112 @@ case (LRDATA)
   end
 endcase
 
-//endgenerate
+end
 
-//----------------------------------------
+endgenerate
 
-localparam MAX_CWLEVEL = 19'h4d800; //(16'h4d80 << 4);
 
-if (CWSHAPE == 1) begin: CW1
+generate if (DEBUGRX == 1) begin: DEBUGRX
 
-  logic [1:0]         cwstate;
+logic [3:0] synthetic_count;
+logic signed [11:0] synthetic_adc;
+logic signed [15:0] debugreg0;
+logic signed [15:0] debugreg1;
+logic signed [15:0] debugreg2;
+logic signed [15:0] debugreg3;
+logic [1:0] debugsel;
 
-  // 4 ms rise and fall, not shaped, but like HiQSDR
-  // MAX CWLEVEL is picked to be 8*max cordic level for transmit
-  // ADJUST if cordic max changes...  
-  localparam  cwrx = 2'b00, 
-              cw_keydowndown = 2'b01, 
-              cw_keydownup = 2'b11;
-
-  // CW state machine
-  always @(posedge clk) begin 
-    case (cwstate)
-      cwrx: begin
-        tx_cw_level <= 1'b0;
-        if (cw_keydown) cwstate <= cw_keydowndown;
-        else cwstate <= cwrx;
-      end
-  
-      cw_keydowndown: begin
-        if (tx_cw_level != MAX_CWLEVEL) tx_cw_level <= tx_cw_level + 1'b1;
-        if (cw_keydown) cwstate <= cw_keydowndown;
-        else cwstate <= cw_keydownup;
-      end
-  
-      cw_keydownup: begin
-        if (tx_cw_level == 0) cwstate <= cwrx;
-        else begin
-          cwstate <= cw_keydownup;
-          tx_cw_level <= tx_cw_level - 1'b1;
-        end
-      end
-    endcase
+always @ (posedge clk) begin
+  if (cmd_rqst & cmd_addr == 6'h39) begin
+    debugreg0 <= 0;
+    debugreg1 <= 0;
+    debugreg2 <= 0;
+    debugreg3 <= 0;
+    debugsel  <= cmd_data[1:0];
+  end else begin
+    if ($signed(mixdata_i[0][17:2]) > debugreg0) debugreg0 <= $signed(mixdata_i[0][17:2]);
+    if (rx0_strobe & ($signed(rx0_out_I[23:8]) > debugreg1)) debugreg1 <= $signed(rx0_out_I[23:8]);
+    if (debug[16] & ($signed(debug[15:0]) > debugreg2)) debugreg2 <= $signed(debug[15:0]);
+    if (debug[33] & ($signed(debug[32:17]) > debugreg3)) debugreg3 <= $signed(debug[32:17]);
   end
+end
 
-  assign tx_cw_key = cwstate != cwrx;
+always @* begin
+  case (debugsel)
+    2'h0: debug_out = debugreg0;
+    2'h1: debug_out = debugreg1;
+    2'h2: debug_out = debugreg2;
+    2'h3: debug_out = debugreg3;
+  endcase
+end
+
+
+// Synthetic 76.8/13 = 5.907 MHz Signal
+always @ (posedge clk) begin
+  if (synthetic_count == 4'hc) synthetic_count <= 4'h0;
+  else synthetic_count <= synthetic_count + 1;
+end
+
+// i from 0 to 12
+//int(round((2**11-1)*np.sin(2*np.pi*i/13+(np.pi/2)+.01)))
+always @* begin
+  case (synthetic_count)
+    4'h0: synthetic_adc = 2047;
+    4'h1: synthetic_adc = 1803;
+    4'h2: synthetic_adc = 1146;
+    4'h3: synthetic_adc = 226;
+    4'h4: synthetic_adc = -745;
+    4'h5: synthetic_adc = -1546;
+    4'h6: synthetic_adc = -1992;
+    4'h7: synthetic_adc = -1983;
+    4'h8: synthetic_adc = -1519;
+    4'h9: synthetic_adc = -707;
+    4'ha: synthetic_adc = 267;
+    4'hb: synthetic_adc = 1180;
+    4'hc: synthetic_adc = 1822;
+    default: synthetic_adc = 2047;
+  endcase
+end
+
+
+// Pipeline for adc fanout
+always @ (posedge clk) begin
+  adcpipe[0] <= synthetic_adc;
+  adcpipe[1] <= rx_data_adc;
+  adcpipe[2] <= rx_data_adc;
+  adcpipe[3] <= rx_data_adc;
+  adcpipe[4] <= rx_data_adc;
+end
 
 end else begin
 
-  assign tx_cw_key = cw_keydown;
-  assign tx_cw_level = MAX_CWLEVEL;
+//logic [11:0] rx_data_adc_pipe;
+
+  // Pipeline for adc fanout
+always @ (posedge clk) begin
+  //rx_data_adc_pipe <= rx_data_adc;
+  adcpipe[0] <= rx_data_adc; //_pipe;
+  adcpipe[1] <= rx_data_adc; //_pipe;
+  adcpipe[2] <= rx_data_adc; //_pipe;
+  adcpipe[3] <= rx_data_adc; //_pipe;
+  //adcpipe[4] <= rx_data_adc_pipe;
+  adcpipe[4] <= rx_data_adc;
 end
 
-end endgenerate
+assign debug_out[15:4] = 12'd0;
+
+always @(posedge clk) begin
+  debug_out[0] <= rx_data_rdy[0];
+  debug_out[1] <= lm_valid;
+  debug_out[2] <= ls_valid;
+  debug_out[3] <= ls_done;
+end
+
+
+end
+endgenerate
+
+
+
 
 endmodule

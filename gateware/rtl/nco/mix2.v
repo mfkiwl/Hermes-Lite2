@@ -1,6 +1,6 @@
 
 `timescale 1us/1ns
-
+/* verilator lint_off WIDTH */
 module mix2 (
   clk,
   clk_2x,
@@ -20,10 +20,10 @@ input                 rst;
 input         [31:0]  phi0;
 input         [31:0]  phi1;
 input  signed [11:0]  adc;
-output signed [17:0]  mixdata0_i;
-output signed [17:0]  mixdata0_q;
-output signed [17:0]  mixdata1_i;
-output signed [17:0]  mixdata1_q;
+output logic signed [17:0]  mixdata0_i;
+output logic signed [17:0]  mixdata0_q;
+output logic signed [17:0]  mixdata1_i;
+output logic signed [17:0]  mixdata1_q;
 
 parameter CALCTYPE = 0;
 
@@ -41,6 +41,7 @@ logic                 state = 1'b0;
 
 nco2 #(.CALCTYPE(CALCTYPE)) nco2_i (
   .state(state),
+  .clk(clk),
   .clk_2x(clk_2x),
   .rst(rst),
   .phi0(phi0),
@@ -61,7 +62,7 @@ always @(posedge clk_2x) begin
   scos_q <= cos[18] ? scos[18:1] : cos[18:1];
 end
 
-always @(posedge clk_2x) begin
+always @(posedge clk) begin
   adci <= adc;
   adcq <= adc;
 end
@@ -85,5 +86,5 @@ always @(posedge clk_2x) begin
 end
 
 endmodule 
-
+/* verilator lint_on WIDTH */
 

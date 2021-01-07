@@ -21,20 +21,22 @@ Boston, MA  02110-1301, USA.
 //------------------------------------------------------------------------------
 
 // 2015 Jan 31 - udated for Hermes-Lite 12bit Steve Haynal KF7O
+/* verilator lint_on WIDTH */
 
-module cic( clock, in_strobe, out_strobe, in_data, out_data );
+module cic( rst_all, clock, in_strobe, out_strobe, in_data, out_data );
 
 //design parameters
 parameter STAGES = 3;
-parameter DECIMATION = 10;  
+parameter DECIMATION = 5;
 parameter IN_WIDTH = 18;
 
 //computed parameters
 //ACC_WIDTH = IN_WIDTH + Ceil(STAGES * Log2(DECIMATION))
 //OUT_WIDTH = IN_WIDTH + Ceil(Log2(DECIMATION) / 2)
-parameter ACC_WIDTH = IN_WIDTH  + 10;
-parameter OUT_WIDTH = IN_WIDTH  + 2; // Hermes only uses ADC input width plus 2 here
+parameter ACC_WIDTH = 25; //IN_WIDTH  + 10;
+parameter OUT_WIDTH = 16; //IN_WIDTH  + 2; // Hermes only uses ADC input width plus 2 here
 
+input rst_all;
 input clock;
 input in_strobe;
 output reg out_strobe;
@@ -47,8 +49,11 @@ output signed [OUT_WIDTH-1:0] out_data;
 reg [15:0] sample_no = 0;
 
 always @(posedge clock)
-  if (in_strobe)
-    begin
+  if (rst_all) begin
+    sample_no <= 0;
+    out_strobe <= 0;
+
+  end else if (in_strobe) begin
     if (sample_no == (DECIMATION-1))
       begin
       sample_no <= 0;
@@ -56,7 +61,7 @@ always @(posedge clock)
       end
     else
       begin
-      sample_no <= sample_no + 8'd1;
+      sample_no <= sample_no + 16'd1;
       out_strobe <= 0;
       end
     end
@@ -119,3 +124,4 @@ assign out_data = comb_data[STAGES][ACC_WIDTH-1:ACC_WIDTH-OUT_WIDTH] +
 
 endmodule
 
+/* verilator lint_on WIDTH */

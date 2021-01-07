@@ -22,9 +22,12 @@ module ad9866 (
   clk,
   clk_2x,
 
+  rst,
+
   tx_data,
   rx_data,
   tx_en,
+  cw_on,
 
   rxclip,
   rxgoodlvl,
@@ -33,18 +36,29 @@ module ad9866 (
   rffe_ad9866_tx,
   rffe_ad9866_rx,
   rffe_ad9866_rxsync,
-  rffe_ad9866_rxclk,  
+  rffe_ad9866_rxclk,
   rffe_ad9866_txquiet_n,
   rffe_ad9866_txsync,
-  rffe_ad9866_mode
+  rffe_ad9866_mode,
+  rffe_ad9866_pga5,
+
+  // Command slave interface
+  cmd_addr,
+  cmd_data,
+  cmd_rqst,
+  cmd_ack
+
 );
 
 input             clk;
 input             clk_2x;
 
+input             rst;
+
 input   [11:0]    tx_data;
 output  [11:0]    rx_data;
 input             tx_en;
+input             cw_on;
 
 output logic      rxclip = 1'b0;
 output logic      rxgoodlvl = 1'b0;
@@ -65,6 +79,16 @@ output            rffe_ad9866_txquiet_n;
 output            rffe_ad9866_txsync;
 
 output            rffe_ad9866_mode;
+
+output            rffe_ad9866_pga5;
+
+// Command slave interface
+input   [5:0]     cmd_addr;
+input   [31:0]    cmd_data;
+input             cmd_rqst;
+output            cmd_ack;
+
+parameter         FAST_LNA = 0;
 
 
 // TX Path
@@ -95,22 +119,88 @@ assign rffe_ad9866_txsync = tx_en_d1;
 assign rffe_ad9866_txquiet_n = clk;
 
 `else
-always @(posedge clk_2x) begin
-  tx_en_d1 <= tx_en;
-  tx_sync <= ~tx_sync;
-  if (tx_en_d1) begin
-    if (tx_sync) begin 
-      tx_data_d1 <= tx_data;
-      rffe_ad9866_tx <= tx_data_d1[5:0];
-    end else begin
-      rffe_ad9866_tx <= tx_data_d1[11:6];
+
+generate if (FAST_LNA == 1) begin: FAST_LNA
+
+  logic   [ 5:0]    gain, tx_gain, rx_gain = 6'h1f;
+  logic             en_tx_gain = 1'b0;
+  logic             pga5_d1;
+  logic             update_gain = 1'b0;
+
+  always @(posedge clk) begin
+    if (cmd_rqst) begin
+      case (cmd_addr)
+          6'h0a: begin
+            rx_gain <= cmd_data[6] ? cmd_data[5:0] : (cmd_data[5] ? ~cmd_data[5:0] : {1'b1,cmd_data[4:0]});
+          end
+
+          6'h0e: begin
+            tx_gain <= cmd_data[14] ? cmd_data[13:8] : (cmd_data[13] ? ~cmd_data[13:8] : {1'b1,cmd_data[12:8]});
+            en_tx_gain <= cmd_data[15];
+          end
+      endcase
     end
-    rffe_ad9866_txsync <= tx_sync;
-  end else begin
-    rffe_ad9866_tx <= 6'h00;
-    rffe_ad9866_txsync <= 1'b0;
+
+    if ((rx_gain != gain) & (~tx_en | (~en_tx_gain & ~cw_on))) begin
+      gain <= rx_gain;
+      update_gain <= 1'b1;
+    end else if ((tx_gain != gain) & (tx_en & en_tx_gain)) begin
+      gain <= tx_gain;
+      update_gain <= 1'b1;
+    end else if ((gain != 6'h0) & ~en_tx_gain & cw_on) begin
+      gain <= 6'h00;
+      update_gain <= 1'b1;
+    end else begin
+      update_gain <= rst;
+    end
   end
-end
+
+  always @(posedge clk_2x) begin
+    tx_en_d1 <= tx_en;
+    tx_sync <= ~tx_sync;
+    if (tx_en_d1) begin
+      if (tx_sync) begin
+        tx_data_d1 <= update_gain ? {gain,tx_data[5:0]} : tx_data;
+        pga5_d1 <= update_gain;
+        rffe_ad9866_tx <= tx_data_d1[5:0];
+        rffe_ad9866_pga5 <= 1'b0;
+        rffe_ad9866_txsync <= ~pga5_d1; // No TX transaction completion if fast LNA update
+      end else begin
+        rffe_ad9866_tx <= tx_data_d1[11:6];
+        rffe_ad9866_pga5 <= pga5_d1;
+        rffe_ad9866_txsync <= 1'b0;
+      end
+    end else begin
+      tx_data_d1 <= {gain,tx_data[5:0]};
+      pga5_d1 <= update_gain;
+      rffe_ad9866_tx <= tx_data_d1[11:6];
+      rffe_ad9866_txsync <= 1'b0;
+      rffe_ad9866_pga5 <= pga5_d1;
+    end
+  end
+
+end else begin: SLOW_LNA
+
+  assign rffe_ad9866_pga5 = 1'b0;
+
+  always @(posedge clk_2x) begin
+    tx_en_d1 <= tx_en;
+    tx_sync <= ~tx_sync;
+    if (tx_en_d1) begin
+      if (tx_sync) begin
+        tx_data_d1 <= tx_data;
+        rffe_ad9866_tx <= tx_data_d1[5:0];
+      end else begin
+        rffe_ad9866_tx <= tx_data_d1[11:6];
+      end
+      rffe_ad9866_txsync <= tx_sync;
+    end else begin
+      rffe_ad9866_tx <= 6'h00;
+      rffe_ad9866_txsync <= 1'b0;
+    end
+  end
+
+end endgenerate
 
 assign rffe_ad9866_txquiet_n = tx_en_d1; 
 

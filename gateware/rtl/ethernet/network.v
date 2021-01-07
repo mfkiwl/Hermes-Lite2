@@ -32,7 +32,7 @@ module network (
 
   // upstream
   input         tx_clock,
-  input         udp_tx_request,
+  input  [1:0]  udp_tx_request,
   input [15:0]  udp_tx_length,
   input [7:0]   udp_tx_data,
   output        udp_tx_enable,
@@ -48,12 +48,14 @@ module network (
   output        dst_unreachable,
 
   // status and control
+  input  [ 7:0] eeprom_config,
   input  [31:0] static_ip,
   input  [47:0] local_mac,
   output        speed_1gb,
   output        network_state_dhcp,
   output        network_state_fixedip,
   output [1:0]  network_speed,
+  output reg    phy_connected,
 
   // phy
   output [3:0]  PHY_TX,
@@ -65,14 +67,15 @@ module network (
   output        PHY_MDC
 );
 
+parameter SIM = 0;
+
 wire udp_tx_active;
 wire eeprom_ready;
 wire [1:0] phy_speed;
 wire phy_duplex;
 wire dhcp_success;
 wire icmp_rx_enable;
-wire static_ip_assigned;
-wire phy_connected = phy_duplex && (phy_speed[1] != phy_speed[0]);
+wire phy_connected_int = phy_duplex && (phy_speed[1] != phy_speed[0]);
 
 reg speed_1gb_i = 1'b0;
 //assign dhcp_timeout = (dhcp_seconds_timer == 15);
@@ -86,13 +89,9 @@ reg  [31:0] local_ip;
 //wire [31:0] apipa_ip = {8'd192, 8'd168, 8'd22, 8'd248};
 wire [31:0] apipa_ip = {8'd169, 8'd254, local_mac[15:0]};
 //wire [31:0] ip_to_write;
-assign static_ip_assigned = (static_ip != 32'hFFFFFFFF) && (static_ip != 32'd0);
-
 
 localparam
   ST_START         = 4'd0,
-  ST_EEPROM_START  = 4'd1,
-  ST_EEPROM_READ   = 4'd2,
   ST_PHY_INIT      = 4'd3,
   ST_PHY_CONNECT   = 4'd4,
   ST_PHY_SETTLE    = 4'd5,
@@ -127,7 +126,7 @@ sync sync_inst2(.clock(tx_clock), .sig_in(state <= ST_PHY_SETTLE), .sig_out(tx_r
 
 always @(negedge clock_2_5MHz)
   //if connection lost, wait until reconnects
-  if ((state > ST_PHY_CONNECT) && !phy_connected) begin
+  if ((state > ST_PHY_CONNECT) && !phy_connected_int) begin
     reg_network_state_dhcp <= 1'b1;
     reg_network_state_fixedip <= 1'b1;
     state <= ST_PHY_CONNECT;
@@ -138,17 +137,6 @@ always @(negedge clock_2_5MHz)
     //set eeprom read request
     ST_START: begin
       speed_1gb_i <= 0;
-      state <= ST_EEPROM_START;
-    end
-    //clear eeprom read request
-    ST_EEPROM_START:
-      state <= ST_EEPROM_READ;
-
-    //wait for eeprom
-    ST_EEPROM_READ: begin
-      local_ip <= static_ip;
-      //dhcp_timer <= 22'd2_500_000;    // set dhcp timer to one second
-      //dhcp_seconds_timer <= 4'd0; // zero seconds have elapsed
       state <= ST_PHY_INIT;
     end
 
@@ -159,8 +147,8 @@ always @(negedge clock_2_5MHz)
     //clear phy initialization request
     //wait for phy to initialize and connect
     ST_PHY_CONNECT:
-      if (phy_connected) begin
-        dhcp_timer <= 22'd2500000; //1 second
+      if (phy_connected_int) begin
+        dhcp_timer <= (SIM==1) ? 22'h01 : 22'd2500000; //1 second
         state <= ST_PHY_SETTLE;
         speed_1gb_i <= phy_speed[1];
       end
@@ -169,9 +157,10 @@ always @(negedge clock_2_5MHz)
     ST_PHY_SETTLE: begin
       //when network has settled, get ip address, if static IP assigned then use it else try DHCP
       if (dhcp_timer == 0) begin
-        if (static_ip_assigned)
+        if (eeprom_config[7] & ~eeprom_config[5]) begin
+          local_ip <= static_ip;
           state <= ST_RUNNING;
-        else begin
+        end else begin
           local_ip <= 32'h00_00_00_00;                // needs to be 0.0.0.0 for DHCP
           dhcp_timer <= 22'd2_500_000;    // set dhcp timer to one second
           dhcp_seconds_timer <= 4'd0; // zero seconds have elapsed
@@ -212,8 +201,12 @@ always @(negedge clock_2_5MHz)
         if (dhcp_seconds_timer == 0 || dhcp_seconds_timer == 2 || dhcp_seconds_timer == 6) begin
           state <= ST_DHCP_RETRY;     // retransmit the Discover request
         end
-        else if (dhcp_seconds_timer == 14) begin    // no DHCP Offer received in 15 seconds; use apipa
-          local_ip <= apipa_ip;
+        else if (dhcp_seconds_timer == 14) begin    // no DHCP Offer received in 15 seconds; use fixed ip or apipa
+          if (eeprom_config[7] & eeprom_config[5]) begin
+            local_ip <= static_ip;
+          end else begin
+            local_ip <= apipa_ip;
+          end
           state <= ST_RUNNING;
         end
       end
@@ -293,33 +286,40 @@ always @(negedge clock_2_5MHz)
 //-----------------------------------------------------------------------------
 // writes configuration words to the phy registers, reads phy state
 //-----------------------------------------------------------------------------
-phy_cfg phy_cfg_inst(
-  .clock(clock_2_5MHz),
-  .init_request(state == ST_PHY_INIT),
-  .allow_1Gbit(1'b1),
-  .speed(phy_speed),
-  .duplex(phy_duplex),
-  .mdio_pin(PHY_MDIO),
-  .mdc_pin(PHY_MDC)
-);
 
-
+generate
+  if (SIM ==1) begin
+    assign phy_speed = 2'b10;
+    assign phy_duplex = 1'b1;
+  end else begin
+    phy_cfg phy_cfg_inst(
+      .clock(clock_2_5MHz),
+      .init_request(state == ST_PHY_INIT),
+      .allow_1Gbit(1'b1),
+      .speed(phy_speed),
+      .duplex(phy_duplex),
+      .mdio_pin(PHY_MDIO),
+      .mdc_pin(PHY_MDC)
+    );
+  end
+endgenerate
 
 //-----------------------------------------------------------------------------
 //                           interconnections
 //-----------------------------------------------------------------------------
-localparam PT_ARP = 2'd0, PT_ICMP = 2'd1, PT_DHCP = 2'd2, PT_UDP = 2'd3;
+localparam PT_ARP = 3'd0, PT_ICMP = 3'd1, PT_DHCP = 3'd2, PT_UDP0 = 3'd4, PT_UDP1 = 3'd5;
 localparam false = 1'b0, true = 1'b1;
 
 
 
 reg tx_ready = false;
 reg tx_start = false;
-reg [1:0] tx_protocol;
+reg [2:0] tx_protocol;
 
 wire tx_is_icmp = tx_protocol == PT_ICMP;
-wire tx_is_arp = tx_protocol  == PT_ARP;
-wire tx_is_udp = tx_protocol  == PT_UDP;
+wire tx_is_arp  = tx_protocol  == PT_ARP;
+wire tx_is_udp  = ((tx_protocol  == PT_UDP0) | (tx_protocol == PT_UDP1));
+wire tx_is_udp1 = tx_protocol == PT_UDP1;
 wire tx_is_dhcp = tx_protocol == PT_DHCP;
 
 
@@ -364,7 +364,7 @@ wire [7:0] arp_tx_data;
 wire [47:0] arp_destination_mac;
 
 // icmp in
-assign  icmp_rx_enable = ip_rx_active && rx_is_icmp;
+assign  icmp_rx_enable = ip_rx_active && rx_is_icmp && to_ip_is_me;
 wire icmp_tx_enable = tx_start && tx_is_icmp;
 //icmp out
 wire icmp_tx_request;
@@ -382,18 +382,29 @@ reg [47:0] run_destination_mac;
 wire ip_tx_enable = icmp_tx_active || udp_tx_active;
 wire [7:0] ip_tx_data_in = tx_is_icmp? icmp_data : udp_data;
 wire [15:0] ip_tx_length = tx_is_icmp? icmp_length : udp_length;
-wire [31:0] destination_ip = tx_is_icmp? icmp_destination_ip : (tx_is_dhcp ? dhcp_destination_ip : run_destination_ip); //udp_destination_ip_sync);
+
+//reg [31:0] destination_ip;
+//always @(posedge tx_clock) destination_ip <=
+wire [31:0] destination_ip = tx_is_icmp ? icmp_destination_ip :
+  (tx_is_dhcp ? dhcp_destination_ip :
+    (tx_is_udp1 ? udp_destination_ip_sync :
+      run_destination_ip));
 
 //ip_send out
 wire [7:0] ip_tx_data;
 wire ip_tx_active;
 
 //mac_send in
-wire mac_tx_enable = arp_tx_active || ip_tx_active;
-wire [7:0] mac_tx_data_in = tx_is_arp? arp_tx_data : ip_tx_data;
+wire        mac_tx_enable   = arp_tx_active || ip_tx_active      ;
+wire [ 7:0] mac_tx_data_in  = tx_is_arp? arp_tx_data : ip_tx_data;
+
+//reg  [47:0] destination_mac                                      ;
+//always @(posedge tx_clock) destination_mac <= 
 wire [47:0] destination_mac = tx_is_arp  ? arp_destination_mac  :
-     tx_is_icmp ? icmp_destination_mac :
-     tx_is_dhcp ? dhcp_destination_mac : run_destination_mac; //udp_destination_mac_sync;
+  tx_is_icmp ? icmp_destination_mac :
+    tx_is_dhcp ? dhcp_destination_mac :
+      tx_is_udp1 ? udp_destination_mac_sync : run_destination_mac;
+
 //mac_send out
 wire [7:0] mac_tx_data;
 wire mac_tx_active;
@@ -413,19 +424,15 @@ wire        rgmii_tx_active;
 //dhcp
 wire [15:0]dhcp_udp_tx_length        = tx_is_dhcp ? dhcp_tx_length        : udp_tx_length;
 wire [7:0] dhcp_udp_tx_data          = tx_is_dhcp ? dhcp_tx_data          : udp_tx_data;
-wire [15:0]local_port                   = tx_is_dhcp ? 16'd68                  : 16'd1024;
+wire [15:0]local_port                = tx_is_dhcp ? 16'd68                : {15'd512,tx_is_udp1};
 
 
+//reg [15:0] dhcp_udp_destination_port;
+//always @(posedge tx_clock) dhcp_udp_destination_port <= 
+wire [15:0] dhcp_udp_destination_port = tx_is_dhcp ? dhcp_destination_port :
+  (tx_is_udp1 ? udp_destination_port_sync :
+    run_destination_port);
 
-// Hold destination port once run is set
-always @(posedge tx_clock)
-  if (!run) begin
-    run_destination_port <= udp_destination_port_sync;
-    run_destination_ip <= udp_destination_ip_sync;
-    run_destination_mac <= udp_destination_mac_sync;
-  end
-
-wire [15:0]dhcp_udp_destination_port = tx_is_dhcp ? dhcp_destination_port : run_destination_port; //udp_destination_port_sync;
 wire dhcp_rx_active;
 wire mac_rx_active;
 
@@ -450,10 +457,14 @@ always @(posedge tx_clock)
       tx_protocol <= PT_DHCP;
       tx_ready <= true;
     end
-    else if (udp_tx_request)  begin
-      tx_protocol <= PT_UDP;
+    else if (udp_tx_request == 2'b10)  begin
+      tx_protocol <= PT_UDP0;
       tx_ready <= true;
-    end;
+    end
+    else if (udp_tx_request == 2'b11)  begin
+      tx_protocol <= PT_UDP1;
+      tx_ready <= true;
+    end
   end
 
 
@@ -462,186 +473,239 @@ always @(posedge tx_clock)
 //                               receive
 //-----------------------------------------------------------------------------
 
+
+wire [15:0] udp_destination_port ;
+wire [47:0] udp_destination_mac  ;
+wire [31:0] udp_destination_ip   ;
+wire        udp_destination_valid;
+
+
 always @(posedge rx_clock) begin
   rx_data <= rx_data_pipe;
   rgmii_rx_active <= rgmii_rx_active_pipe;
 end
 
-rgmii_recv rgmii_recv_inst (
-  //out
-  .active(rgmii_rx_active_pipe),
 
-  .reset(rx_reset),
-  .clock(rx_clock),
-  .speed_1gb(speed_1gb_i),
-  .data(rx_data_pipe),
-  .PHY_RX(PHY_RX),
-  .PHY_DV(PHY_DV)
+rgmii_recv #(.SIM(SIM)) rgmii_recv_inst (
+  //out
+  .active   (rgmii_rx_active_pipe),
+  .reset    (rx_reset            ),
+  .clock    (rx_clock            ),
+  .speed_1gb(speed_1gb_i         ),
+  .data     (rx_data_pipe        ),
+  .PHY_RX   (PHY_RX              ),
+  .PHY_DV   (PHY_DV              )
 );
 
-mac_recv mac_recv_inst(
+
+
+mac_recv mac_recv_inst (
   //in
-  .rx_enable(mac_rx_enable),
+  .rx_enable       (mac_rx_enable   ),
   //out
-  .active(mac_rx_active),
-  .is_arp(rx_is_arp),
-  .remote_mac(remote_mac),
-  .clock(rx_clock),
-  .data(rx_data),
-  .local_mac(local_mac),
-  .broadcast(broadcast)
+  .active          (mac_rx_active   ),
+  .is_arp          (rx_is_arp       ),
+  .remote_mac      (remote_mac      ),
+  .remote_mac_valid(remote_mac_valid),
+  .clock           (rx_clock        ),
+  .data            (rx_data         ),
+  .local_mac       (local_mac       ),
+  .broadcast       (broadcast       )
 );
 
-
-ip_recv ip_recv_inst(
+ip_recv ip_recv_inst (
   // in
-  .local_ip(local_ip),
+  .local_ip       (local_ip       ),
   //out
-  .active(ip_rx_active),
-  .is_icmp(rx_is_icmp),
-  .remote_ip(remote_ip),
-  .clock(rx_clock),
-  .rx_enable(ip_rx_enable),
-  .broadcast(broadcast),
-  .data(rx_data),
-
-  .to_ip(to_ip)
+  .active         (ip_rx_active   ),
+  .is_icmp        (rx_is_icmp     ),
+  .remote_ip      (remote_ip      ),
+  .remote_ip_valid(remote_ip_valid),
+  .clock          (rx_clock       ),
+  .rx_enable      (ip_rx_enable   ),
+  .broadcast      (broadcast      ),
+  .data           (rx_data        ),
+  .to_ip          (to_ip          ),
+  .to_ip_is_me    (to_ip_is_me    )
 );
 
-udp_recv udp_recv_inst(
+udp_recv udp_recv_inst (
   //in
-  .clock(rx_clock),
-  .rx_enable(udp_rx_enable),
-  .data(rx_data),
-  .to_ip(to_ip),
-  .local_ip(local_ip),
-  .broadcast(broadcast),
-  .remote_mac(remote_mac),
-  .remote_ip(remote_ip),
-
+  .clock                (rx_clock             ),
+  .run                  (run                  ),
+  .rx_enable            (udp_rx_enable        ),
+  .data                 (rx_data              ),
+  .to_ip                (to_ip                ),
+  .local_ip             (local_ip             ),
+  .broadcast            (broadcast            ),
+  .remote_mac           (remote_mac           ),
+  .remote_ip            (remote_ip            ),
   //out
-  .active(udp_rx_active),
-  .dhcp_active(dhcp_rx_active),
-  .to_port(to_port),
-  .udp_destination_ip(udp_destination_ip),
-  .udp_destination_mac(udp_destination_mac),
-  .udp_destination_port(udp_destination_port)
+  .active               (udp_rx_active        ),
+  .dhcp_active          (dhcp_rx_active       ),
+  .to_port              (to_port              ),
+  .udp_destination_ip   (udp_destination_ip   ),
+  .udp_destination_mac  (udp_destination_mac  ),
+  .udp_destination_port (udp_destination_port ),
+  .udp_destination_valid(udp_destination_valid)
 );
 
 //-----------------------------------------------------------------------------
 //                           receive/reply
 //-----------------------------------------------------------------------------
-arp arp_inst(
+arp arp_inst (
   //in
-  .rx_enable(arp_rx_enable),
-  .tx_enable(arp_tx_enable),
+  .rx_enable      (arp_rx_enable      ),
+  .tx_enable      (arp_tx_enable      ),
   //out
-  .tx_active(arp_tx_active),
-  .tx_data(arp_tx_data),
+  .tx_active      (arp_tx_active      ),
+  .tx_data        (arp_tx_data        ),
   .destination_mac(arp_destination_mac),
-  .reset(tx_reset),
-  .rx_clock(rx_clock),
-  .rx_data(rx_data),
-  .tx_clock(tx_clock),
-  .local_mac(local_mac),
-  .local_ip(local_ip),
-  .tx_request(arp_tx_request),
-  .remote_mac(remote_mac_sync)
+  .reset          (tx_reset           ),
+  .rx_clock       (rx_clock           ),
+  .rx_data        (rx_data            ),
+  .tx_clock       (tx_clock           ),
+  .local_mac      (local_mac          ),
+  .local_ip       (local_ip           ),
+  .tx_request     (arp_tx_request     ),
+  .remote_mac     (remote_mac         )
 );
 
-icmp icmp_inst (
-  //in
-  .rx_enable(icmp_rx_enable),
-  .tx_enable(icmp_tx_enable),
-  //out
-  .tx_request(icmp_tx_request),
-  .tx_active(icmp_tx_active),
-  .tx_data(icmp_data),
-  .destination_mac(icmp_destination_mac),
-  .destination_ip(icmp_destination_ip),
-  .length(icmp_length),
-  .dst_unreachable(dst_unreachable),
+generate
+  if (SIM==1) begin
 
-  .remote_mac(remote_mac_sync),
-  .remote_ip(remote_ip_sync),
-  .reset(tx_reset),
-  .rx_clock(rx_clock),
-  .rx_data(rx_data),
-  .tx_clock(tx_clock)
-);
+    assign dst_unreachable = 1'b0;
+    assign tx_request = 1'b0;
+    assign tx_active = 1'b0;
+    assign tx_data = 8'h00;
+    assign length = 16'h0000;
+    assign destination_mac = 48'h00;
+    assign destination_ip = 32'h00;
 
-wire dhcp_tx_request;
-reg dhcp_enable;
-wire [7:0]  dhcp_tx_data;
-wire [15:0] dhcp_tx_length;
-wire [47:0] dhcp_destination_mac;
-wire [31:0] dhcp_destination_ip;
+  end else begin
+
+    icmp icmp_inst (
+      //in
+      .rx_enable(icmp_rx_enable),
+      .tx_enable(icmp_tx_enable),
+      //out
+      .tx_request(icmp_tx_request),
+      .tx_active(icmp_tx_active),
+      .tx_data(icmp_data),
+      .destination_mac(icmp_destination_mac),
+      .destination_ip(icmp_destination_ip),
+      .length(icmp_length),
+      .dst_unreachable(dst_unreachable),
+
+      .remote_mac(remote_mac_sync),
+      .remote_ip(remote_ip_sync),
+      .reset(tx_reset),
+      .rx_clock(rx_clock),
+      .rx_data(rx_data),
+      .tx_clock(tx_clock)
+    );
+  end
+endgenerate
+
+wire        dhcp_tx_request      ;
+reg         dhcp_enable          ;
+wire [ 7:0] dhcp_tx_data         ;
+wire [15:0] dhcp_tx_length       ;
+wire [47:0] dhcp_destination_mac ;
+wire [31:0] dhcp_destination_ip  ;
 wire [15:0] dhcp_destination_port;
-wire [31:0] ip_accept;                  // DHCP provided IP address
-wire [31:0] lease;                      // time in seconds that DHCP supplied IP address is valid
-wire [31:0] server_ip;                  // IP address of the DHCP that provided the IP address
-wire erase;
-wire EPCS_FIFO_enable;
-wire [47:0]remote_mac;
-wire [31:0]remote_ip;
-wire [15:0]remote_port;
+wire [31:0] ip_accept            ; // DHCP provided IP address
+wire [31:0] lease                ; // time in seconds that DHCP supplied IP address is valid
+wire [31:0] server_ip            ; // IP address of the DHCP that provided the IP address
+wire        erase                ;
+wire        EPCS_FIFO_enable     ;
+wire [47:0] remote_mac           ;
+wire        remote_mac_valid     ;
+wire [31:0] remote_ip            ;
+wire        remote_ip_valid      ;
 
-
-dhcp dhcp_inst(
+dhcp dhcp_inst (
   //rx in
-  .rx_clock(rx_clock),
-  .rx_data(rx_data),
-  .rx_enable(dhcp_enable),
-  .dhcp_rx_active(dhcp_rx_active),
+  .rx_clock             (rx_clock             ),
+  .rx_data              (rx_data              ),
+  .rx_enable            (dhcp_enable          ),
+  .dhcp_rx_active       (dhcp_rx_active       ),
   //rx out
-  .lease(lease),
-  .server_ip(server_ip),
+  .lease                (lease                ),
+  .server_ip            (server_ip            ),
 
   //tx in
-  .reset(tx_reset),
-  .tx_clock(tx_clock),
-  .udp_tx_enable(udp_tx_enable),
-  .tx_enable(dhcp_tx_enable),
-  .udp_tx_active(udp_tx_active),
-  .remote_mac(remote_mac_sync),             // MAC address of DHCP server
-  .remote_ip(remote_ip_sync),               // IP address of DHCP server
-  .dhcp_seconds_timer(dhcp_seconds_timer),
+  .reset                (tx_reset             ),
+  .tx_clock             (tx_clock             ),
+  .udp_tx_enable        (udp_tx_enable        ),
+  .tx_enable            (dhcp_tx_enable       ),
+  .udp_tx_active        (udp_tx_active        ),
+  .remote_mac           (remote_mac_sync      ), // MAC address of DHCP server
+  .remote_ip            (remote_ip_sync       ), // IP address of DHCP server
+  .dhcp_seconds_timer   (dhcp_seconds_timer   ),
+  .local_ip             (local_ip           ),
 
   // tx_out
-  .dhcp_tx_request(dhcp_tx_request),
-  .tx_data(dhcp_tx_data),
-  .length(dhcp_tx_length),
-  .ip_accept(ip_accept),                // IP address from DHCP server
+  .dhcp_tx_request      (dhcp_tx_request      ),
+  .tx_data              (dhcp_tx_data         ),
+  .length               (dhcp_tx_length       ),
+  .ip_accept            (ip_accept            ), // IP address from DHCP server
 
   //constants
-  .local_mac(local_mac),
-  .dhcp_destination_mac(dhcp_destination_mac),
-  .dhcp_destination_ip(dhcp_destination_ip),
+  .local_mac            (local_mac            ),
+  .dhcp_destination_mac (dhcp_destination_mac ),
+  .dhcp_destination_ip  (dhcp_destination_ip  ),
   .dhcp_destination_port(dhcp_destination_port),
 
   // result
-  .dhcp_success(dhcp_success),
-  .dhcp_failed()
-
+  .dhcp_success         (dhcp_success         ),
+  .dhcp_failed          (                     )
 );
 
 //-----------------------------------------------------------------------------
 //                                rx to tx clock domain transfers
 //-----------------------------------------------------------------------------
-wire [47:0] remote_mac_sync;
-wire [31:0] remote_ip_sync;
-wire [15:0] udp_destination_port;
-wire [15:0] udp_destination_port_sync;
-wire [47:0] udp_destination_mac;
-wire [47:0] udp_destination_mac_sync;
-wire [31:0] udp_destination_ip;
-wire [31:0] udp_destination_ip_sync;
+reg  [47:0] remote_mac_sync           ;
+wire        remote_mac_valid_sync     ;
+reg  [31:0] remote_ip_sync            ;
+wire        remote_ip_valid_sync      ;
+reg  [15:0] udp_destination_port_sync ;
+reg  [47:0] udp_destination_mac_sync  ;
+reg  [31:0] udp_destination_ip_sync   ;
+wire        udp_destination_valid_sync;
 
-cdc_sync #(48)cdc_sync_inst1 (.siga(remote_mac), .rstb(1'b0), .clkb(tx_clock), .sigb(remote_mac_sync));
-cdc_sync #(32)cdc_sync_inst2 (.siga(remote_ip), .rstb(1'b0), .clkb(tx_clock), .sigb(remote_ip_sync));
-cdc_sync #(32) cdc_sync_inst7 (.siga(udp_destination_ip), .rstb(1'b0), .clkb(tx_clock), .sigb(udp_destination_ip_sync));
-cdc_sync #(48) cdc_sync_inst8 (.siga(udp_destination_mac), .rstb(1'b0), .clkb(tx_clock), .sigb(udp_destination_mac_sync));
-cdc_sync #(16) cdc_sync_inst9 (.siga(udp_destination_port), .rstb(1'b0), .clkb(tx_clock), .sigb(udp_destination_port_sync));
+//cdc_sync #(48) cdc_sync_inst1 (.siga(remote_mac), .rstb(1'b0), .clkb(tx_clock), .sigb(remote_mac_sync));
+//cdc_sync #(32) cdc_sync_inst2 (.siga(remote_ip), .rstb(1'b0), .clkb(tx_clock), .sigb(remote_ip_sync));
+
+sync_pulse remote_ip_sync_i     (.clock(tx_clock), .sig_in(remote_ip_valid),       .sig_out(remote_ip_valid_sync));
+sync_pulse remote_mac_sync_i    (.clock(tx_clock), .sig_in(remote_mac_valid),      .sig_out(remote_mac_valid_sync));
+sync_pulse udp_destination_sync (.clock(tx_clock), .sig_in(udp_destination_valid), .sig_out(udp_destination_valid_sync));
+
+always @(posedge tx_clock) begin
+  if (udp_destination_valid_sync) begin
+    // Alternate port 1025 info
+    if (to_port[0]) begin
+      udp_destination_ip_sync   <= udp_destination_ip;
+      udp_destination_mac_sync  <= udp_destination_mac;
+      udp_destination_port_sync <= udp_destination_port;
+    end
+    else if (~run) begin
+      run_destination_ip <= udp_destination_ip;
+      run_destination_mac <= udp_destination_mac;
+      run_destination_port <= udp_destination_port;
+    end
+  end
+
+  if (remote_mac_valid_sync) begin
+    remote_mac_sync <= remote_mac;
+  end
+
+  if (remote_ip_valid) begin
+    remote_ip_sync <= remote_ip;
+  end
+
+end
+
 
 
 //-----------------------------------------------------------------------------
@@ -650,65 +714,65 @@ cdc_sync #(16) cdc_sync_inst9 (.siga(udp_destination_port), .rstb(1'b0), .clkb(t
 
 udp_send udp_send_inst (
   //in
-  .reset(tx_reset),
-  .clock(tx_clock),
-  .tx_enable(udp_tx_enable),
-  .data_in(dhcp_udp_tx_data),
-  .length_in(dhcp_udp_tx_length),
-  .local_port(local_port),
+  .reset           (tx_reset                 ),
+  .clock           (tx_clock                 ),
+  .tx_enable       (udp_tx_enable            ),
+  .data_in         (dhcp_udp_tx_data         ),
+  .length_in       (dhcp_udp_tx_length       ),
+  .local_port      (local_port               ),
   .destination_port(dhcp_udp_destination_port),
   //out
-  .active(udp_tx_active),
-  .data_out(udp_data),
-  .length_out(udp_length),
-  .port_ID(port_id)
+  .active          (udp_tx_active            ),
+  .data_out        (udp_data                 ),
+  .length_out      (udp_length               ),
+  .port_ID         (port_id                  )
 );
 
 ip_send ip_send_inst (
   //in
-  .data_in(ip_tx_data_in),
-  .tx_enable(ip_tx_enable),
-  .is_icmp(tx_is_icmp),
-  .length(ip_tx_length),
+  .data_in       (ip_tx_data_in ),
+  .tx_enable     (ip_tx_enable  ),
+  .is_icmp       (tx_is_icmp    ),
+  .length        (ip_tx_length  ),
   .destination_ip(destination_ip),
   //out
-  .data_out(ip_tx_data),
-  .active(ip_tx_active),
-
-  .clock(tx_clock),
-  .reset(tx_reset),
-  .local_ip(local_ip)
+  .data_out      (ip_tx_data    ),
+  .active        (ip_tx_active  ),
+  .clock         (tx_clock      ),
+  .reset         (tx_reset      ),
+  .local_ip      (local_ip      )
 );
 
 mac_send mac_send_inst (
   //in
-  .data_in(mac_tx_data_in),
-  .tx_enable(mac_tx_enable),
+  .data_in        (mac_tx_data_in ),
+  .tx_enable      (mac_tx_enable  ),
   .destination_mac(destination_mac),
   //out
-  .data_out(mac_tx_data),
-  .active(mac_tx_active),
-
-  .clock(tx_clock),
-  .local_mac(local_mac),
-  .reset(tx_reset)
+  .data_out       (mac_tx_data    ),
+  .active         (mac_tx_active  ),
+  .clock          (tx_clock       ),
+  .local_mac      (local_mac      ),
+  .reset          (tx_reset       )
 );
 
 always @(posedge tx_clock) begin
   rgmii_tx_data_in_pipe <= rgmii_tx_data_in;
-  rgmii_tx_enable_pipe <= rgmii_tx_enable;
+  rgmii_tx_enable_pipe  <= rgmii_tx_enable;
 end
 
-rgmii_send rgmii_send_inst (
+
+rgmii_send #(.SIM(SIM)) rgmii_send_inst (
   //in
-  .data(rgmii_tx_data_in_pipe),
-  .tx_enable(rgmii_tx_enable_pipe),
-  .active(rgmii_tx_active),
-  .clock(tx_clock),
-  .PHY_TX(PHY_TX),
-  .PHY_TX_EN(PHY_TX_EN)
+  .data     (rgmii_tx_data_in_pipe),
+  .tx_enable(rgmii_tx_enable_pipe ),
+  .active   (rgmii_tx_active      ),
+  .clock    (tx_clock             ),
+  .PHY_TX   (PHY_TX               ),
+  .PHY_TX_EN(PHY_TX_EN            )
 );
 
+always @(negedge clock_2_5MHz) phy_connected <= phy_connected_int;
 
 //-----------------------------------------------------------------------------
 //                              debug output
