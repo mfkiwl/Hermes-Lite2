@@ -139,8 +139,8 @@ parameter       BYPASS_VERSA = 0;
 
 localparam      TUSERWIDTH = (AK4951 == 1) ? 16 : 2;
 
-localparam      VERSION_MAJOR = (BOARD==2) ? 8'd52 : 8'd72;
-localparam      VERSION_MINOR = 8'd8;
+localparam      VERSION_MAJOR = (BOARD==2) ? 8'd52 : 8'd73;
+localparam      VERSION_MINOR = 8'd0;
 
 logic   [5:0]   cmd_addr;
 logic   [31:0]  cmd_data;
@@ -303,7 +303,7 @@ logic           atu_txinhibit, atu_txinhibit_ad9866ync;
 logic        stall_req, stall_req_sync;
 logic        stall_ack, stall_ack_ad9866;
 logic        rst_all, rst_nco;
-logic        link_running, link_running_iosync;
+logic        link_running;
 logic        link_master ;
 logic [23:0] lm_data     ;
 logic        lm_valid    ;
@@ -329,7 +329,10 @@ logic        ds_pkt_usopenhpsdr1       ;
 logic        hl2link_rst_req, hl2link_rst_ack;
 
 logic [15:0] debug;
-assign debug_out = debug[3:0];
+//assign debug_out = debug[3:0];
+logic link_error;
+assign debug_out = {cmd_rqst_ad9866,debug[2],link_error,debug[0]};
+
 
 /////////////////////////////////////////////////////
 // Clocks
@@ -713,7 +716,8 @@ usopenhpsdr1 #(
   .fwdpwr(fwdpwr),
   .revpwr(revpwr),
   .bias(bias),
-  .dsiq_status(control_dsiq_status)
+  .dsiq_status(control_dsiq_status),
+  .master_link_running(link_running & link_master)
 );
 
 usiq_fifo #(.AK4951(AK4951))
@@ -847,6 +851,7 @@ radio_i
   .ls_valid(ls_valid),
   .ls_done(ls_done),
 
+  .ds_cmd_ptt(ds_cmd_ptt), // Not working about async here since psuedo static
   .run(run_ad9866sync),
   .qmsec_pulse(qmsec_pulse_ad9866sync),
   .ext_keydown(cw_keydown_ad9866sync),
@@ -975,7 +980,7 @@ control #(
   .rxgoodlvl          (rxgoodlvl_iosync           ),
   .rxclrstatus        (rxclrstatus                ),
   .run                (run_iosync                 ),
-  .link_running       (link_running & ~link_master),
+  .slave_link_running (link_running & ~link_master),
   
   .dsiq_status        (dsiq_status                ),
   .dsiq_sample        (dsiq_sample                ),
@@ -1209,7 +1214,8 @@ if (HL2LINK == 1) begin
     .cmd_is_alt     (cmd_is_alt        ),
     .cmd_rqst       (cmd_rqst_ad9866   ),
     .hl2link_rst_req(hl2link_rst_req   ),
-    .hl2link_rst_ack(hl2link_rst_ack   )
+    .hl2link_rst_ack(hl2link_rst_ack   ),
+    .link_error(link_error)
   );
 
   //assign io_uart_txd = cmd_cnt;
